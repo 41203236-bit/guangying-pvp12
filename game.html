@@ -75,15 +75,16 @@ if (window.firebase && !firebase.apps.length) firebase.initializeApp(firebaseCon
 const db = window.firebase ? firebase.database() : null;
 const params = new URLSearchParams(location.search);
 const roomCode = params.get('room') || localStorage.getItem('gy_battle_room_code') || 'LOCAL';
-const mySlot = params.get('slot') || localStorage.getItem('gy_battle_slot') || 'O';
+let mySlot = params.get('slot') || localStorage.getItem('gy_battle_slot') || 'O';
+const playerId = localStorage.getItem('gy_player_id') || '';
 const onlineMode = !!(db && roomCode && roomCode !== 'LOCAL');
 document.getElementById('roomCode').textContent = roomCode;
 
 const sounds={tap:new Audio('sounds/tap.mp3'),atk:new Audio('sounds/atk.mp3'),def:new Audio('sounds/def.mp3'),hel:new Audio('sounds/hel.mp3'),stn:new Audio('sounds/stn.mp3'),tick:new Audio('sounds/tick.mp3')};
 const WIN_LINES=[[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
 const initialPlayerState=()=>({hp:100,sp:0,ult:0,skillUsed:0,stunned:0,defending:false,darkStacks:0});
-const initialBattleState=()=>({
-  turn:'O',
+const initialBattleState=(host='O')=>({
+  turn:host==='X'?'X':'O',
   grid:Array(9).fill(null),
   queues:{O:[],X:[]},
   data:{O:initialPlayerState(),X:initialPlayerState()},
@@ -92,13 +93,32 @@ const initialBattleState=()=>({
   resolving:false,
   placedThisTurn:false,
   winner:null,
-  lastEvent:null
+  lastEvent:null,
+  winLines:[]
 });
+function asFirebaseArray(v,length){ if(Array.isArray(v)) return v; if(v&&typeof v==='object'){ const arr=Array(length).fill(null); for(const [k,val] of Object.entries(v)){ const i=Number(k); if(Number.isInteger(i)&&i>=0&&i<length) arr[i]=val; } return arr; } return null; }
+function normalizeBattleState(raw, host='O'){ const d=initialBattleState(host); const s=(raw&&typeof raw==='object')?raw:{}; return {
+  turn:(s.turn==='O'||s.turn==='X')?s.turn:d.turn,
+  grid:(asFirebaseArray(s.grid,9)||d.grid).map(v=>(v==='O'||v==='X')?v:null),
+  queues:{
+    O:(asFirebaseArray(s.queues?.O,9)||[]).filter(n=>Number.isInteger(n)&&n>=0&&n<9),
+    X:(asFirebaseArray(s.queues?.X,9)||[]).filter(n=>Number.isInteger(n)&&n>=0&&n<9)
+  },
+  data:{ O:{...d.data.O,...(s.data?.O||{})}, X:{...d.data.X,...(s.data?.X||{})} },
+  timeLeft:Number.isFinite(s.timeLeft)?s.timeLeft:d.timeLeft,
+  turnEndsAt:Number.isFinite(s.turnEndsAt)?s.turnEndsAt:d.turnEndsAt,
+  resolving:!!s.resolving,
+  placedThisTurn:!!s.placedThisTurn,
+  winner:s.winner||null,
+  lastEvent:s.lastEvent||null,
+  winLines:Array.isArray(s.winLines)?s.winLines:[]
+}; }
 let PLAYER_CONFIG = {
   O: { faction: 'light', role: 'mage' },
   X: { faction: 'dark', role: 'assassin' }
 };
 let battleState = initialBattleState();
+let roomCache = null;
 let localMode=true, timer=null, lastShownEventKey='';
 window.turn='O';
 window.data=battleState.data;
@@ -109,6 +129,13 @@ function clone(obj){ return JSON.parse(JSON.stringify(obj)); }
 function playSound(name){const s=sounds[name]; if(s){s.pause(); s.currentTime=0; s.play().catch(()=>{});}}
 function stopSound(name){const s=sounds[name]; if(s){s.pause(); s.currentTime=0;}}
 function otherSlot(s){ return s==='O'?'X':'O'; }
+function resolveMySlot(players){
+  if(playerId){
+    if(players?.O?.clientId && players.O.clientId===playerId) return 'O';
+    if(players?.X?.clientId && players.X.clientId===playerId) return 'X';
+  }
+  return mySlot==='X'?'X':'O';
+}
 
 function buildBoard(){
   const board=document.getElementById('board');board.innerHTML='';
@@ -242,30 +269,46 @@ function showWinner(){
   overlay.classList.add('show');
 }
 
-function attachBattleListener(){
-  battleRef().on('value', snap=>{
-    const val=snap.val();
-    if(!val) return;
+function attachRoomListener(){
+  roomRef().on('value', snap=>{
+    const room = snap.val();
+    if(!room) return;
+    roomCache = room;
+    const resolvedSlot = resolveMySlot(room.players || {});
+    if(resolvedSlot !== mySlot){
+      mySlot = resolvedSlot;
+      localStorage.setItem('gy_battle_slot', mySlot);
+    }
+    applyPlayerConfig(room.players || {});
     const prev = clone(battleState);
-    battleState = val;
-    showBattleEvent(val.lastEvent);
+    battleState = normalizeBattleState(room.battle, room.hostSlot || 'O');
+    showBattleEvent(battleState.lastEvent);
     updateUI();
-    if (prev.turn !== val.turn && val.data[val.turn].ult >= 100) showUltReadyTip(val.turn);
-    if (val.winLines) drawWinLines(val.winLines);
+    if (prev.turn !== battleState.turn && (battleState.data?.[battleState.turn]?.ult || 0) >= 100) showUltReadyTip(battleState.turn);
+    if (battleState.winLines && battleState.winLines.length) drawWinLines(battleState.winLines); else drawWinLines([]);
     if (isGameOver()) showWinner();
   });
 }
 
 async function ensureOnlineBattle(){
   const roomSnap = await roomRef().get();
-  const room = roomSnap.val() || {};
+  const room = roomSnap.val();
+  if (!room) throw new Error('room not found');
+  roomCache = room;
+  mySlot = resolveMySlot(room.players || {});
+  localStorage.setItem('gy_battle_slot', mySlot);
   applyPlayerConfig(room.players || {});
-  const battleSnap = await battleRef().get();
-  if (!battleSnap.exists()) {
-    const init = initialBattleState();
-    await battleRef().set(init);
-  }
-  attachBattleListener();
+  await roomRef().transaction(r=>{
+    if(!r) return r;
+    if(!r.battle){
+      r.battle = initialBattleState(r.hostSlot || 'O');
+    } else {
+      r.battle = normalizeBattleState(r.battle, r.hostSlot || 'O');
+    }
+    if(!r.phase || r.phase==='starting') r.phase = 'playing';
+    return r;
+  });
+  attachRoomListener();
 }
 
 function localSettleAndReturn(state, player){
