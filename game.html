@@ -57,7 +57,6 @@ body{margin:0;padding:12px 0 0;min-height:100vh;color:white;font-family:"Microso
 <div id="resultOverlay"><div id="resultCard" class="result-card win"><h1 id="resultTitle" class="result-title">勝利</h1><div id="resultSub" class="result-sub">本局已結束</div><div class="result-actions"><button id="btnRematch">重新遊玩</button><button id="btnBackMenu">返回菜單</button></div></div></div>
 <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
-
 <script>
 const firebaseConfig = {
   apiKey: "AIzaSyAmjWi-07_edTrrCKGBjo1JHvz-o1CloPM",
@@ -71,387 +70,73 @@ const firebaseConfig = {
 const ROLE_IMAGE = { mage:'mage.png', knight:'knight.png', assassin:'assassin.png' };
 const ROLE_LABEL = { mage:'法師', knight:'騎士', assassin:'刺客' };
 const FACTION_LABEL = { light:'光', dark:'暗' };
-if (window.firebase && !firebase.apps.length) firebase.initializeApp(firebaseConfig);
+if (window.firebase && !firebase.apps.length) { firebase.initializeApp(firebaseConfig); }
 const db = window.firebase ? firebase.database() : null;
-const params = new URLSearchParams(location.search);
-const roomCode = params.get('room') || localStorage.getItem('gy_battle_room_code') || 'LOCAL';
-let mySlot = params.get('slot') || localStorage.getItem('gy_battle_slot') || 'O';
-const playerId = localStorage.getItem('gy_player_id') || '';
-const onlineMode = !!(db && roomCode && roomCode !== 'LOCAL');
-document.getElementById('roomCode').textContent = roomCode;
-
+let PLAYER_CONFIG = {
+  O: { faction: localStorage.getItem('gy_battle_slot')==='O' ? (localStorage.getItem('gy_battle_faction')||'light') : 'light', role: localStorage.getItem('gy_battle_slot')==='O' ? (localStorage.getItem('gy_battle_role')||'mage') : 'mage' },
+  X: { faction: localStorage.getItem('gy_battle_slot')==='X' ? (localStorage.getItem('gy_battle_faction')||'dark') : 'dark', role: localStorage.getItem('gy_battle_slot')==='X' ? (localStorage.getItem('gy_battle_role')||'assassin') : 'assassin' }
+};
+function applyBattleSelections(){
+  ['O','X'].forEach(slot=>{
+    const cfg = PLAYER_CONFIG[slot] || {};
+    const faction = cfg.faction || (slot==='O' ? 'light' : 'dark');
+    const role = cfg.role || (slot==='O' ? 'mage' : 'assassin');
+    const badge = document.getElementById(`badge-${slot}`);
+    if (badge) badge.textContent = `${FACTION_LABEL[faction] || faction} / ${slot}`;
+    const avatar = document.getElementById(`avatar-${slot}`);
+    if (avatar && ROLE_IMAGE[role]) { avatar.src = ROLE_IMAGE[role]; avatar.alt = `${ROLE_LABEL[role]||role}-${slot}`; }
+    const buff = document.getElementById(`buff-text-${slot}`);
+    if (buff) buff.textContent = faction==='light' ? '直排：當下回復 8 HP' : `直排增加傷害（${(window.data && data[slot] ? data[slot].darkStacks : 0)} 層）`;
+  });
+  const turnTextEl = document.getElementById('turnText');
+  if (turnTextEl && window.turn) {
+    const faction = PLAYER_CONFIG[window.turn]?.faction || (window.turn==='O' ? 'light' : 'dark');
+    turnTextEl.textContent = `目前回合：${FACTION_LABEL[faction] || faction} / ${window.turn}`;
+  }
+}
+async function loadBattleSelections(){
+  const params = new URLSearchParams(location.search);
+  const roomCode = params.get('room') || localStorage.getItem('gy_battle_room_code');
+  if (!db || !roomCode || roomCode==='LOCAL') { applyBattleSelections(); return; }
+  try {
+    const snap = await db.ref(`rooms/${roomCode}/players`).get();
+    const players = snap.exists() ? snap.val() : null;
+    if (players?.O) PLAYER_CONFIG.O = { faction: players.O.faction || PLAYER_CONFIG.O.faction, role: players.O.role || PLAYER_CONFIG.O.role };
+    if (players?.X) PLAYER_CONFIG.X = { faction: players.X.faction || PLAYER_CONFIG.X.faction, role: players.X.role || PLAYER_CONFIG.X.role };
+  } catch (e) { console.warn('loadBattleSelections failed', e); }
+  applyBattleSelections();
+}
+</script>
+<script>
 const sounds={tap:new Audio('sounds/tap.mp3'),atk:new Audio('sounds/atk.mp3'),def:new Audio('sounds/def.mp3'),hel:new Audio('sounds/hel.mp3'),stn:new Audio('sounds/stn.mp3'),tick:new Audio('sounds/tick.mp3')};
 const WIN_LINES=[[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
-const initialPlayerState=()=>({hp:100,sp:0,ult:0,skillUsed:0,stunned:0,defending:false,darkStacks:0});
-const initialBattleState=(host='O')=>({
-  turn:host==='X'?'X':'O',
-  grid:Array(9).fill(null),
-  queues:{O:[],X:[]},
-  data:{O:initialPlayerState(),X:initialPlayerState()},
-  timeLeft:60,
-  turnEndsAt:Date.now()+60000,
-  resolving:false,
-  placedThisTurn:false,
-  winner:null,
-  lastEvent:null,
-  winLines:[]
-});
-function asFirebaseArray(v,length){ if(Array.isArray(v)) return v; if(v&&typeof v==='object'){ const arr=Array(length).fill(null); for(const [k,val] of Object.entries(v)){ const i=Number(k); if(Number.isInteger(i)&&i>=0&&i<length) arr[i]=val; } return arr; } return null; }
-function normalizeBattleState(raw, host='O'){ const d=initialBattleState(host); const s=(raw&&typeof raw==='object')?raw:{}; return {
-  turn:(s.turn==='O'||s.turn==='X')?s.turn:d.turn,
-  grid:(asFirebaseArray(s.grid,9)||d.grid).map(v=>(v==='O'||v==='X')?v:null),
-  queues:{
-    O:(asFirebaseArray(s.queues?.O,9)||[]).filter(n=>Number.isInteger(n)&&n>=0&&n<9),
-    X:(asFirebaseArray(s.queues?.X,9)||[]).filter(n=>Number.isInteger(n)&&n>=0&&n<9)
-  },
-  data:{ O:{...d.data.O,...(s.data?.O||{})}, X:{...d.data.X,...(s.data?.X||{})} },
-  timeLeft:Number.isFinite(s.timeLeft)?s.timeLeft:d.timeLeft,
-  turnEndsAt:Number.isFinite(s.turnEndsAt)?s.turnEndsAt:d.turnEndsAt,
-  resolving:!!s.resolving,
-  placedThisTurn:!!s.placedThisTurn,
-  winner:s.winner||null,
-  lastEvent:s.lastEvent||null,
-  winLines:Array.isArray(s.winLines)?s.winLines:[]
-}; }
-let PLAYER_CONFIG = {
-  O: { faction: 'light', role: 'mage' },
-  X: { faction: 'dark', role: 'assassin' }
-};
-let battleState = initialBattleState();
-let roomCache = null;
-let localMode=true, timer=null, lastShownEventKey='';
-window.turn='O';
-window.data=battleState.data;
-
-function roomRef(path=''){ return db.ref(`rooms/${roomCode}${path?`/${path}`:''}`); }
-function battleRef(path=''){ return db.ref(`rooms/${roomCode}/battle${path?`/${path}`:''}`); }
-function clone(obj){ return JSON.parse(JSON.stringify(obj)); }
-function playSound(name){const s=sounds[name]; if(s){s.pause(); s.currentTime=0; s.play().catch(()=>{});}}
-function stopSound(name){const s=sounds[name]; if(s){s.pause(); s.currentTime=0;}}
-function otherSlot(s){ return s==='O'?'X':'O'; }
-function resolveMySlot(players){
-  if(playerId){
-    if(players?.O?.clientId && players.O.clientId===playerId) return 'O';
-    if(players?.X?.clientId && players.X.clientId===playerId) return 'X';
-  }
-  return mySlot==='X'?'X':'O';
-}
-
-function buildBoard(){
-  const board=document.getElementById('board');board.innerHTML='';
-  for(let i=0;i<9;i++){
-    const d=document.createElement('div');
-    d.className='cell';d.id='c-'+i;d.onclick=()=>tap(i);board.appendChild(d)
-  }
-}
-
-function buildSpDots(sp){
-  let html='';
-  for(let i=0;i<5;i++){
-    const seg=Math.max(0,Math.min(20,sp-i*20)); const fillPct=(seg/20)*100;
-    html+=`<div class="sp-dot-wrap"><div class="sp-dot-base"></div><div class="sp-dot-fill" style="clip-path: inset(${100-fillPct}% 0 0 0)"></div></div>`;
-  }
-  return html;
-}
-function buildUltDots(ult){
-  let html='';
-  for(let i=0;i<5;i++){
-    const seg=Math.max(0,Math.min(20,ult-i*20)); const fillPct=(seg/20)*100;
-    html+=`<div class="ult-dot-wrap"><div class="ult-dot-base"></div><div class="ult-dot-fill" style="clip-path: inset(${100-fillPct}% 0 0 0)"></div></div>`;
-  }
-  return html;
-}
+const params=new URLSearchParams(location.search); const roomCode=params.get('room')||localStorage.getItem('gy_battle_room_code')||'LOCAL';
+document.getElementById('roomCode').textContent=roomCode;
+let turn='O', grid=Array(9).fill(null), queues={O:[],X:[]}; window.turn=turn;
+let data={O:{hp:100,sp:0,ult:0,skillUsed:0,stunned:0,defending:false,darkStacks:0},X:{hp:100,sp:0,ult:0,skillUsed:0,stunned:0,defending:false,darkStacks:0}};
+let timeLeft=60,timer,resolving=false,placedThisTurn=false; const ultReadyShown={O:false,X:false};
+function buildBoard(){const board=document.getElementById('board');board.innerHTML='';for(let i=0;i<9;i++){const d=document.createElement('div');d.className='cell';d.id='c-'+i;d.onclick=()=>tap(i);board.appendChild(d)}}
+function playSound(name){const s=sounds[name]; if(s){s.pause(); s.currentTime=0; s.play().catch(()=>{});}} function stopSound(name){const s=sounds[name]; if(s){s.pause(); s.currentTime=0;}}
+function startTimer(){clearInterval(timer); stopSound('tick'); timeLeft=60; const el=document.getElementById('timer-container'); el.textContent=timeLeft; el.classList.remove('timer-warn'); timer=setInterval(()=>{if(resolving) return; timeLeft--; el.textContent=timeLeft; if(timeLeft<=10) el.classList.add('timer-warn'); if(timeLeft<=10 && timeLeft>0) playSound('tick'); if(timeLeft<=0){stopSound('tick'); swapTurn();}},1000)}
+function tap(i){if(grid[i]||isGameOver()||resolving||placedThisTurn) return; playSound('tap'); if(queues[turn].length>=3){const removed=queues[turn].shift(); grid[removed]=null;} grid[i]=turn; queues[turn].push(i); placedThisTurn=true; render(); const results=collectWinsFor(turn); if(results.length){resolving=true; stopSound('tick'); settleLines(results,turn);} else {updateUI();}}
+function collectWinsFor(player){return WIN_LINES.filter(line=>line.every(idx=>grid[idx]===player));}
+function calcLineSp(line){return line.includes(4)?40:20}
+function settleLines(lines,player){const uniqueCells=[...new Set(lines.flat())]; drawWinLines(lines); let totalSp=0, lightHeals=0, darkStacksGain=0; lines.forEach(line=>{totalSp+=calcLineSp(line); const isVertical=(line[1]-line[0]===3 && line[2]-line[1]===3); if(isVertical){if((PLAYER_CONFIG[player]?.faction||'light')==='light') lightHeals+=8; if((PLAYER_CONFIG[player]?.faction||'dark')==='dark') darkStacksGain+=1;}}); data[player].sp=Math.min(100,data[player].sp+totalSp); if(totalSp>0) showFloatText(`hp-box-${player}`, `+${totalSp} SP`, '#71e9ff', -34, 0); if(lightHeals>0){data[player].hp=Math.min(100,data[player].hp+lightHeals); showFloatText(`hp-box-${player}`, `+${lightHeals} HP`, '#4CAF50', 34, 70);} if(darkStacksGain>0){data[player].darkStacks=Math.min(2,data[player].darkStacks+darkStacksGain); showFloatText(`hp-box-${player}`, `增加傷害 ${data[player].darkStacks} 層`, '#d7a6ff', 34, 70);} setTimeout(()=>{uniqueCells.forEach(idx=>{grid[idx]=null; queues.O=queues.O.filter(v=>v!==idx); queues.X=queues.X.filter(v=>v!==idx);}); document.getElementById('win-line-canvas').innerHTML=''; resolving=false; render(); updateUI();},850)}
+function useSkill(type){let p=turn; if(data[p].stunned>0||data[p].skillUsed>=3||isGameOver()||resolving||!placedThisTurn) return; let cost=(type==='atk'?20:type==='stn'?60:40); if(data[p].sp<cost) return; data[p].sp-=cost; data[p].skillUsed++; data[p].ult=Math.min(100,(data[p].ult||0)+(type==='atk'?25:(type==='stn'?35:20))); let target=p==='O'?'X':'O'; playSound(type); if(type==='atk'){let dmg=10; if(data[p].darkStacks>=1) dmg+=2; if(data[p].darkStacks>=2){dmg+=2; if(Math.random()<0.4) dmg+=4;} data[p].darkStacks=0; if(data[target].defending){dmg=Math.max(0,dmg-5); data[target].defending=false;} data[target].hp=Math.max(0,data[target].hp-dmg); triggerShake(); showFloatText(`hp-box-${target}`, `-${dmg}`, '#ff4b2b', 0, 0);} else if(type==='def'){data[p].defending=true;} else if(type==='hel'){data[p].hp=Math.min(100,data[p].hp+8); showFloatText(`hp-box-${p}`, `+8 HP`, '#4CAF50', 0, 0);} else if(type==='stn'){data[target].stunned=3; triggerShake(); showFloatText(`hp-box-${target}`, '主動技', '#ff00ff', 0, 0);} updateUI(); checkEnd();}
+function swapTurn(){stopSound('tick'); if(data[turn].stunned>0) data[turn].stunned--; data[turn].skillUsed=0; placedThisTurn=false; turn=turn==='O'?'X':'O'; window.turn=turn; data[turn].defending=false; startTimer(); updateUI();}
+function drawWinLines(lines){const canvas=document.getElementById('win-line-canvas'); const wrap=document.querySelector('.board-wrapper').getBoundingClientRect(); canvas.innerHTML=lines.map(combo=>{const start=document.getElementById('c-'+combo[0]).getBoundingClientRect(); const end=document.getElementById('c-'+combo[2]).getBoundingClientRect(); const x1=(start.left+start.width/2)-wrap.left, y1=(start.top+start.height/2)-wrap.top; const x2=(end.left+end.width/2)-wrap.left, y2=(end.top+end.height/2)-wrap.top; return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" class="winning-line" />`;}).join('')}
+function render(){for(let i=0;i<9;i++){let el=document.getElementById('c-'+i); el.innerText=grid[i]||''; el.className='cell '+(grid[i]||''); if(grid[i]&&queues[grid[i]].length===3&&queues[grid[i]][0]===i){el.classList.add('warning-cell');}}}
+function buildSpDots(sp){let html=''; for(let i=0;i<5;i++){const seg=Math.max(0,Math.min(20,sp-i*20)); const fillPct=(seg/20)*100; html+=`<div class="sp-dot-wrap"><div class="sp-dot-base"></div><div class="sp-dot-fill" style="clip-path: inset(${100-fillPct}% 0 0 0)"></div></div>`;} return html}
+function buildUltDots(ult){let html=''; for(let i=0;i<5;i++){const seg=Math.max(0,Math.min(20,ult-i*20)); const fillPct=(seg/20)*100; html+=`<div class="ult-dot-wrap"><div class="ult-dot-base"></div><div class="ult-dot-fill" style="clip-path: inset(${100-fillPct}% 0 0 0)"></div></div>`;} return html}
+function updateUI(){document.getElementById('turnText').textContent=`目前回合：${(FACTION_LABEL[PLAYER_CONFIG[turn]?.faction] || (turn==='O'?'光':'暗'))} / ${turn}`; document.getElementById('board').classList.toggle('locked', placedThisTurn); ['O','X'].forEach(p=>{const hp=data[p].hp; document.getElementById(`hp-fill-${p}`).style.clipPath=`inset(${100-hp}% 0 0 0)`; document.getElementById(`hp-ghost-${p}`).style.clipPath=`inset(${100-hp}% 0 0 0)`; const valEl=document.getElementById(`hp-val-${p}`); valEl.innerText=Math.floor(hp)+'%'; valEl.style.top=`calc(${100-hp}% + 10px)`; const avatar=document.getElementById(`avatar-${p}`); if(data[p].stunned>0) avatar.classList.add('stunned-avatar'); else avatar.classList.remove('stunned-avatar'); if(data[p].defending) document.getElementById(`hp-fill-${p}`).classList.add('defending-bar'); else document.getElementById(`hp-fill-${p}`).classList.remove('defending-bar'); document.getElementById(`panel-${p}`).className='side-panel'+(turn===p?' active-side-'+p:''); document.getElementById(`sp-display-${p}`).innerHTML=buildSpDots(data[p].sp); document.getElementById(`ult-display-${p}`).innerHTML=buildUltDots(data[p].ult||0); document.getElementById(`sp-text-${p}`).innerText=`SP ${data[p].sp} / 100`; document.getElementById(`ult-text-${p}`).innerText=`ULT ${data[p].ult||0} / 100`; document.getElementById(`buff-text-${p}`).innerText=(PLAYER_CONFIG[p]?.faction||'light')==='light'?'直排：當下回復 8 HP':`直排增加傷害（${data[p].darkStacks} 層）`; const ultCol=document.getElementById(`ult-display-${p}`).parentElement; const ready=(data[p].ult||0)>=100; ultCol.classList.toggle('ult-ready-glow', ready); if(ready && !ultReadyShown[p]){showUltReadyTip(p); ultReadyShown[p]=true;} if(!ready) ultReadyShown[p]=false;}); let dotsHTML=''; for(let i=0;i<3;i++) dotsHTML+=`<div class="u-dot ${i<(3-data[turn].skillUsed)?'fill':''}"></div>`; document.getElementById('usage-dots-container').innerHTML=dotsHTML; let isCurrentStunned=data[turn].stunned>0; let skills=[{t:'atk',c:20},{t:'def',c:40},{t:'hel',c:40},{t:'stn',c:60}]; let html=''; skills.forEach(s=>{let can=(placedThisTurn&&!isCurrentStunned&&data[turn].sp>=s.c&&data[turn].skillUsed<3&&!isGameOver()&&!resolving); html+=`<button class="s-btn btn-${s.t} ${can?'active':''}" onclick="useSkill('${s.t}')"><div class="cost-tag">SP ${s.c}</div></button>`;}); document.getElementById('skill-list-container').innerHTML=html;}
 function triggerShake(){document.getElementById('main-container').classList.add('shake-effect'); setTimeout(()=>document.getElementById('main-container').classList.remove('shake-effect'),300)}
-function showFloatText(id,txt,col,x=0,y=0){const box=document.getElementById(id); if(!box) return; const el=document.createElement('div'); el.className='float-text'; el.innerText=txt; el.style.color=col; el.style.left=`calc(50% + ${x}px)`; el.style.top=`${220+y}px`; box.appendChild(el); setTimeout(()=>el.remove(),1000)}
-function showUltReadyTip(p){const tip=document.getElementById('ultReadyTip'); tip.textContent=`${p===mySlot?'你':'對手'}可以施放大招，按空白鍵`; tip.classList.add('show'); clearTimeout(showUltReadyTip.t); showUltReadyTip.t=setTimeout(()=>tip.classList.remove('show'),5000);}
-function calcLineSp(line){ return line.includes(4)?40:20; }
-function collectWinsForGrid(grid, player){ return WIN_LINES.filter(line=>line.every(idx=>grid[idx]===player)); }
-
-function applyPlayerConfig(players){
-  if (players?.O) PLAYER_CONFIG.O = { faction: players.O.faction || 'light', role: players.O.role || 'mage' };
-  if (players?.X) PLAYER_CONFIG.X = { faction: players.X.faction || 'dark', role: players.X.role || 'assassin' };
-  ['O','X'].forEach(slot=>{
-    const cfg=PLAYER_CONFIG[slot]||{};
-    const faction=cfg.faction||'light'; const role=cfg.role||'mage';
-    const badge=document.getElementById(`badge-${slot}`); if(badge) badge.textContent=`${FACTION_LABEL[faction]||faction} / ${slot}`;
-    const avatar=document.getElementById(`avatar-${slot}`); if(avatar && ROLE_IMAGE[role]) { avatar.src=ROLE_IMAGE[role]; avatar.alt=`${ROLE_LABEL[role]||role}-${slot}`; }
-  });
-}
-
-function showBattleEvent(ev){
-  if(!ev) return;
-  const key = JSON.stringify(ev);
-  if(key===lastShownEventKey) return;
-  lastShownEventKey = key;
-  const slot = ev.player || 'O';
-  if (ev.sp) showFloatText(`hp-box-${slot}`, `+${ev.sp} SP`, '#71e9ff', -30, -8);
-  if (ev.heal) showFloatText(`hp-box-${slot}`, `+${ev.heal} HP`, '#4CAF50', 30, 56);
-  if (ev.darkStacksGain) showFloatText(`hp-box-${slot}`, `增加傷害 ${ev.newDarkStacks} 層`, '#d7a6ff', 30, 56);
-  if (ev.damage) showFloatText(`hp-box-${ev.target}`, `-${ev.damage}`, '#ff4b2b', 0, 0);
-  if (ev.skill === 'stn') showFloatText(`hp-box-${ev.target}`, '主動技', '#ff00ff', 0, 0);
-  if (ev.ultCast) showFloatText(`hp-box-${slot}`, 'ULT!', '#ffd36d', 0, 10);
-}
-
-function drawWinLines(lines){
-  const canvas=document.getElementById('win-line-canvas');
-  const wrap=document.querySelector('.board-wrapper').getBoundingClientRect();
-  canvas.innerHTML=(lines||[]).map(combo=>{
-    const start=document.getElementById('c-'+combo[0]).getBoundingClientRect();
-    const end=document.getElementById('c-'+combo[2]).getBoundingClientRect();
-    const x1=(start.left+start.width/2)-wrap.left, y1=(start.top+start.height/2)-wrap.top;
-    const x2=(end.left+end.width/2)-wrap.left, y2=(end.top+end.height/2)-wrap.top;
-    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" class="winning-line" />`;
-  }).join('');
-  if(lines && lines.length) setTimeout(()=>{ document.getElementById('win-line-canvas').innerHTML=''; }, 850);
-}
-
-function updateTimerDisplay(){
-  const el=document.getElementById('timer-container');
-  let remain = battleState.timeLeft || 0;
-  if(onlineMode && battleState.turnEndsAt){ remain = Math.max(0, Math.ceil((battleState.turnEndsAt - Date.now())/1000)); }
-  el.textContent = remain;
-  el.classList.toggle('timer-warn', remain<=10);
-}
-
-function updateUI(){
-  const state=battleState;
-  window.turn=state.turn; window.data=state.data;
-  document.getElementById('turnText').textContent=`目前回合：${FACTION_LABEL[PLAYER_CONFIG[state.turn]?.faction] || state.turn} / ${state.turn}`;
-  document.getElementById('board').classList.toggle('locked', state.placedThisTurn && state.turn===mySlot);
-  for(let i=0;i<9;i++){
-    let el=document.getElementById('c-'+i); el.innerText=state.grid[i]||''; el.className='cell '+(state.grid[i]||'');
-    if(state.grid[i] && state.queues[state.grid[i]]?.length===3 && state.queues[state.grid[i]][0]===i) el.classList.add('warning-cell');
-  }
-  ['O','X'].forEach(p=>{
-    const hp=state.data[p].hp;
-    document.getElementById(`hp-fill-${p}`).style.clipPath=`inset(${100-hp}% 0 0 0)`;
-    document.getElementById(`hp-ghost-${p}`).style.clipPath=`inset(${100-hp}% 0 0 0)`;
-    const valEl=document.getElementById(`hp-val-${p}`); valEl.innerText=Math.floor(hp)+'%'; valEl.style.top=`calc(${100-hp}% + 10px)`;
-    const avatar=document.getElementById(`avatar-${p}`);
-    avatar.classList.toggle('stunned-avatar', state.data[p].stunned>0);
-    document.getElementById(`hp-fill-${p}`).classList.toggle('defending-bar', !!state.data[p].defending);
-    document.getElementById(`panel-${p}`).className='side-panel'+(state.turn===p?' active-side-'+p:'');
-    document.getElementById(`sp-display-${p}`).innerHTML=buildSpDots(state.data[p].sp);
-    document.getElementById(`ult-display-${p}`).innerHTML=buildUltDots(state.data[p].ult||0);
-    document.getElementById(`sp-text-${p}`).innerText=`SP ${state.data[p].sp} / 100`;
-    document.getElementById(`ult-text-${p}`).innerText=`ULT ${state.data[p].ult||0} / 100`;
-    document.getElementById(`buff-text-${p}`).innerText=(PLAYER_CONFIG[p]?.faction||'light')==='light'?'直排：當下回復 8 HP':`直排增加傷害（${state.data[p].darkStacks} 層）`;
-    const ultCol=document.getElementById(`ult-display-${p}`).parentElement;
-    const ready=(state.data[p].ult||0)>=100;
-    ultCol.classList.toggle('ult-ready-glow', ready);
-  });
-  let dotsHTML=''; for(let i=0;i<3;i++) dotsHTML+=`<div class="u-dot ${i<(3-state.data[state.turn].skillUsed)?'fill':''}"></div>`;
-  document.getElementById('usage-dots-container').innerHTML=dotsHTML;
-  const isCurrentStunned=state.data[state.turn].stunned>0;
-  const isMyTurn = state.turn===mySlot;
-  const skills=[{t:'atk',c:20},{t:'def',c:40},{t:'hel',c:40},{t:'stn',c:60}];
-  let html='';
-  skills.forEach(s=>{
-    let can=isMyTurn&&state.placedThisTurn&&!isCurrentStunned&&state.data[state.turn].sp>=s.c&&state.data[state.turn].skillUsed<3&&!isGameOver()&&!state.resolving;
-    html+=`<button class="s-btn btn-${s.t} ${can?'active':''}" onclick="useSkill('${s.t}')"><div class="cost-tag">SP ${s.c}</div></button>`;
-  });
-  document.getElementById('skill-list-container').innerHTML=html;
-  const endBtn=document.getElementById('endTurnBtn');
-  endBtn.disabled = !(isMyTurn && state.placedThisTurn && !state.resolving && !isGameOver());
-  endBtn.style.opacity = endBtn.disabled ? '.55' : '1';
-  updateTimerDisplay();
-}
-
-function isGameOver(){ return !!battleState.winner || battleState.data.O.hp<=0 || battleState.data.X.hp<=0; }
-function showWinner(){
-  if(!isGameOver()) return;
-  clearInterval(timer); stopSound('tick');
-  const winner=battleState.winner || (battleState.data.O.hp<=0?'X':'O');
-  const overlay=document.getElementById('resultOverlay'); const card=document.getElementById('resultCard'); const title=document.getElementById('resultTitle'); const sub=document.getElementById('resultSub');
-  card.className='result-card '+(winner===mySlot?'win':'lose');
-  title.textContent = `${ROLE_LABEL[PLAYER_CONFIG[winner]?.role] || winner}勝利`;
-  sub.textContent = `${winner} 方獲勝`;
-  overlay.classList.add('show');
-}
-
-function attachRoomListener(){
-  roomRef().on('value', snap=>{
-    const room = snap.val();
-    if(!room) return;
-    roomCache = room;
-    const resolvedSlot = resolveMySlot(room.players || {});
-    if(resolvedSlot !== mySlot){
-      mySlot = resolvedSlot;
-      localStorage.setItem('gy_battle_slot', mySlot);
-    }
-    applyPlayerConfig(room.players || {});
-    const prev = clone(battleState);
-    battleState = normalizeBattleState(room.battle, room.hostSlot || 'O');
-    showBattleEvent(battleState.lastEvent);
-    updateUI();
-    if (prev.turn !== battleState.turn && (battleState.data?.[battleState.turn]?.ult || 0) >= 100) showUltReadyTip(battleState.turn);
-    if (battleState.winLines && battleState.winLines.length) drawWinLines(battleState.winLines); else drawWinLines([]);
-    if (isGameOver()) showWinner();
-  });
-}
-
-async function ensureOnlineBattle(){
-  const roomSnap = await roomRef().get();
-  const room = roomSnap.val();
-  if (!room) throw new Error('room not found');
-  roomCache = room;
-  mySlot = resolveMySlot(room.players || {});
-  localStorage.setItem('gy_battle_slot', mySlot);
-  applyPlayerConfig(room.players || {});
-  await roomRef().transaction(r=>{
-    if(!r) return r;
-    if(!r.battle){
-      r.battle = initialBattleState(r.hostSlot || 'O');
-    } else {
-      r.battle = normalizeBattleState(r.battle, r.hostSlot || 'O');
-    }
-    if(!r.phase || r.phase==='starting') r.phase = 'playing';
-    return r;
-  });
-  attachRoomListener();
-}
-
-function localSettleAndReturn(state, player){
-  const lines = collectWinsForGrid(state.grid, player);
-  if (!lines.length) return state;
-  let totalSp=0, lightHeals=0, darkStacksGain=0;
-  lines.forEach(line=>{
-    totalSp += calcLineSp(line);
-    const isVertical = (line[1]-line[0]===3 && line[2]-line[1]===3);
-    if(isVertical){
-      const faction = (PLAYER_CONFIG[player]?.faction||'light');
-      if(faction==='light') lightHeals += 8;
-      if(faction==='dark') darkStacksGain += 1;
-    }
-  });
-  state.data[player].sp = Math.min(100, state.data[player].sp + totalSp);
-  if(lightHeals>0) state.data[player].hp = Math.min(100, state.data[player].hp + lightHeals);
-  if(darkStacksGain>0) state.data[player].darkStacks = Math.min(2, state.data[player].darkStacks + darkStacksGain);
-  const uniqueCells=[...new Set(lines.flat())];
-  uniqueCells.forEach(idx=>{
-    state.grid[idx]=null;
-    state.queues.O = state.queues.O.filter(v=>v!==idx);
-    state.queues.X = state.queues.X.filter(v=>v!==idx);
-  });
-  state.lastEvent = { type:'line', player, sp:totalSp||0, heal:lightHeals||0, darkStacksGain:darkStacksGain||0, newDarkStacks:state.data[player].darkStacks||0, lines, ts:Date.now() };
-  state.winLines = lines;
-  return state;
-}
-
-function tap(i){
-  if (onlineMode) return tapOnline(i);
-}
-async function tapOnline(i){
-  if (!onlineMode) return;
-  playSound('tap');
-  await battleRef().transaction(state=>{
-    if(!state) state = initialBattleState();
-    if(state.turn !== mySlot || state.resolving || state.winner) return state;
-    if(state.placedThisTurn) return state;
-    if(state.grid[i]) return state;
-    if((state.queues[mySlot]||[]).length>=3){
-      const removed = state.queues[mySlot].shift();
-      state.grid[removed]=null;
-    }
-    state.grid[i]=mySlot;
-    state.queues[mySlot]=state.queues[mySlot]||[];
-    state.queues[mySlot].push(i);
-    state.placedThisTurn=true;
-    state = localSettleAndReturn(state, mySlot);
-    return state;
-  });
-}
-
-async function useSkill(type){
-  if (!onlineMode) return;
-  playSound(type);
-  await battleRef().transaction(state=>{
-    if(!state) return state;
-    const p=mySlot;
-    if(state.turn!==p || state.winner || state.resolving || !state.placedThisTurn) return state;
-    if(state.data[p].stunned>0 || state.data[p].skillUsed>=3) return state;
-    let cost=(type==='atk'?20:type==='stn'?60:40);
-    if(state.data[p].sp<cost) return state;
-    const target=otherSlot(p);
-    state.data[p].sp -= cost;
-    state.data[p].skillUsed += 1;
-    state.data[p].ult = Math.min(100,(state.data[p].ult||0) + (type==='atk'?25:(type==='stn'?35:20)));
-    let event = {type:'skill', skill:type, player:p, target, ts:Date.now()};
-    if(type==='atk'){
-      let dmg=10;
-      if(state.data[p].darkStacks>=1) dmg+=2;
-      if(state.data[p].darkStacks>=2){ dmg+=2; if(Math.random()<0.4) dmg+=4; }
-      state.data[p].darkStacks=0;
-      if(state.data[target].defending){ dmg=Math.max(0,dmg-5); state.data[target].defending=false; }
-      state.data[target].hp=Math.max(0,state.data[target].hp-dmg);
-      event.damage=dmg;
-    } else if(type==='def'){
-      state.data[p].defending=true;
-    } else if(type==='hel'){
-      state.data[p].hp=Math.min(100,state.data[p].hp+8);
-      event.heal=8;
-    } else if(type==='stn'){
-      state.data[target].stunned=3;
-    }
-    if(state.data.O.hp<=0 || state.data.X.hp<=0) state.winner = state.data.O.hp<=0?'X':'O';
-    state.lastEvent = event;
-    return state;
-  });
-}
-
-async function swapTurn(){
-  if (!onlineMode) return;
-  await battleRef().transaction(state=>{
-    if(!state) return state;
-    if(state.turn !== mySlot || state.winner) return state;
-    if(state.data[state.turn].stunned>0) state.data[state.turn].stunned--;
-    state.data[state.turn].skillUsed=0;
-    state.placedThisTurn=false;
-    state.turn = otherSlot(state.turn);
-    state.data[state.turn].defending=false;
-    state.timeLeft=60;
-    state.turnEndsAt=Date.now()+60000;
-    state.lastEvent={type:'turn',player:state.turn,ts:Date.now()};
-    state.winLines=[];
-    return state;
-  });
-}
-
-async function castUlt(){
-  if (!onlineMode) return;
-  await battleRef().transaction(state=>{
-    if(!state) return state;
-    const p=mySlot;
-    if(state.turn!==p || state.winner || (state.data[p].ult||0)<100) return state;
-    state.data[p].ult=0;
-    state.lastEvent={type:'ult', ultCast:true, player:p, ts:Date.now()};
-    return state;
-  });
-}
-
-function initLocalFallback(){
-  // keep simple local preview if firebase unavailable
-  updateUI();
-}
-
-function startPresenceTimer(){
-  clearInterval(timer);
-  timer=setInterval(()=>{
-    updateTimerDisplay();
-    if(onlineMode && battleState.turn===mySlot && battleState.turnEndsAt && Date.now()>=battleState.turnEndsAt && !isGameOver()) swapTurn();
-  },250);
-}
-
-document.getElementById('btnRematch').onclick=()=>location.reload();
-document.getElementById('btnBackMenu').onclick=()=>location.href='menu.html';
-document.getElementById('endTurnBtn').onclick=()=>swapTurn();
+function showFloatText(id,txt,col,x=0,y=0){const box=document.getElementById(id); const el=document.createElement('div'); el.className='float-text'; el.innerText=txt; el.style.color=col; el.style.left=`calc(50% + ${x}px)`; el.style.top=`${220+y}px`; box.appendChild(el); setTimeout(()=>el.remove(),1000)}
+function showUltReadyTip(p){const tip=document.getElementById('ultReadyTip'); tip.textContent=`${p==='O'?'光方':'暗方'}可以施放大招，按空白鍵`; tip.classList.add('show'); clearTimeout(showUltReadyTip.t); showUltReadyTip.t=setTimeout(()=>tip.classList.remove('show'),5000);}
+function castUlt(){const p=turn; if((data[p].ult||0)<100||isGameOver()||resolving) return; data[p].ult=0; showFloatText(`hp-box-${p}`, 'ULT!', '#ffd36d', 0, 10); updateUI();}
+function isGameOver(){return data.O.hp<=0||data.X.hp<=0}
+function checkEnd(){if(!isGameOver()) return; clearInterval(timer); stopSound('tick'); const winner=data.O.hp<=0?'X':'O'; const overlay=document.getElementById('resultOverlay'); const card=document.getElementById('resultCard'); const title=document.getElementById('resultTitle'); const sub=document.getElementById('resultSub'); card.className='result-card '+(winner==='O'?'win':'lose'); title.textContent=winner==='O'?'光方勝利':'暗方勝利'; sub.textContent=`${winner==='O'?'O':'X'} 在本地測試模式獲勝`; overlay.classList.add('show');}
+document.getElementById('btnRematch').onclick=()=>location.reload(); document.getElementById('btnBackMenu').onclick=()=>location.href='menu.html'; const endBtn=document.getElementById('endTurnBtn'); if(endBtn) endBtn.onclick=()=>swapTurn();
 document.addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault(); castUlt();}});
-
-buildBoard();
-if (onlineMode) {
-  ensureOnlineBattle().then(()=>{ startPresenceTimer(); updateUI(); }).catch(err=>{ console.warn(err); initLocalFallback(); startPresenceTimer(); });
-} else {
-  initLocalFallback(); startPresenceTimer();
-}
+buildBoard(); startTimer(); updateUI(); loadBattleSelections();
 </script>
 </body></html>
